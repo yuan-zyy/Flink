@@ -479,7 +479,74 @@ TaskManager 是真正执行计算的**工作节点**，核心结构：
 
 #### 4.2.1 并行度（Parallelism）
 
+##### 4.2.1.1 核心概念
 
+​	Flink 的并行度是指**一个算子（Operator）、算子子任务（Subtask）或整个作业（Job）同时执行的实例数量**。简单来说，并行度决定了 Flink 任务能利用多少计算资源（如 CPU 核心）来处理数据，是 Flink 实现分布式计算的核心配置
+
+​	例如：当前要处理的数据量非常大时，我们可以把一个算子操作，“复制” 多份到多个节点，数据来了之后就可以到其中任意一个执行。这样一来，一个算子任务就被拆分成了多个并行的 “子任务” （subtasks），再将它们分发到不同的节点，真正实现了并行计算
+
+​	再 Flink 执行过程中，每一个算子（operator）可以包含一个或多个子任务（operator subtask），这些子任务在不同的线程、不同的物理机或不同的容器中完全独立地执行
+
+
+
+​	一个特定算子的<span style="color:red">**子任务（subtask）的个数**</span>被称之为<span style="color:red">**并行度（parallelism）**</span>。包含并行子任务的数据流，就是<span style="color:red">**并行数据流**</span>，它需要多个分区（stream partition）来分配并行任务。一般情况下，<span style="color:red">**一个流程序的并行度**</span>，可以认为就是<span style="color:red">**其所有算子中最大的并行度**</span>。一个程序中，不同的算子可能有不同的并行度
+
+##### 4.2.1.2 并行度的层级与优先级
+
+Flink 中并行度可以在 4 个层级配置，优先级从高到低一次是：
+
+1. **算子级别（最高）**：为单个算子指定并行度
+2. **执行环境级别**：为当前作业的所有算子设置默认并行度
+3. **客户端级别**：提交作业时通过命令执行
+4. **集群级别（最低）**：Flink 集群的默认配置（flink-conf.yaml 中的 parallelism.default）
+
+**示例：不同层级的并行度设置**
+
+```java
+
+public class Parallelism_Demo {
+
+    public static void main(String[] args) throws Exception {
+        // 1. 创建执行环境
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // 2. 执行环境级别：设置当前作业默认并行度为 2
+        env.setParallelism(2);
+
+        // 3. 算子级别：为 source 算子设置并行度 3（优先级高于环境级别）
+        env.addSource(new CustomSource())
+                .setParallelism(1)  // Source 并行度 3 这是设置为3会报错
+                .map(value -> value + " processed")
+                .setParallelism(4)  // Map 并行度 4
+                .print()            // Print 算子使用环境默认并行度 2
+                .setParallelism(2);
+
+        // 执行作业
+        env.execute();
+    }
+
+    // 自定义简单 source
+    static class CustomSource implements SourceFunction<String> {
+        private boolean isRuning = true;
+
+        @Override
+        public void run(SourceContext<String> ctx) throws Exception {
+            int i = 0;
+            while (isRuning) {
+                ctx.collect("data-" + i++);
+                Thread.sleep(1000);
+            }
+        }
+
+        @Override
+        public void cancel() {
+            isRuning = false;
+        }
+    }
+
+}
+
+```
 
 
 

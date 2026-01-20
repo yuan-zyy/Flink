@@ -4,6 +4,8 @@ import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.java.tuple.Tuple;
 import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.RestOptions;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.datastream.KeyedStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
@@ -14,9 +16,13 @@ public class Parallelism01 {
 
     public static void main(String[] args) {
         // 1. 环境准备
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+//        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        Configuration config = new Configuration();
+        config.set(RestOptions.PORT, 8081);
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.createLocalEnvironmentWithWebUI(config);
+        env.setParallelism(3);
         // 2. 从指定的网络端口读取数据
-        DataStreamSource<String> ds = env.readTextFile("E:\\Idea\\Idea_Study\\Flink\\chapter02-introduction\\input\\word.txt");
+        DataStreamSource<String> ds = env.socketTextStream("localhost", 6666);
         // 3. 对读取的数据进行扁平化处理 --- 向下游传递的是一个个单词而不是二元组
         SingleOutputStreamOperator<String> soso = ds.flatMap(new FlatMapFunction<String, String>() {
             @Override
@@ -26,7 +32,7 @@ public class Parallelism01 {
                     collector.collect(word);
                 }
             }
-        });
+        }).setParallelism(4);
         // 4. 对流中的数据进行类型转换 String -> Tuple2<String, Long>
         SingleOutputStreamOperator<Tuple2<String, Long>> result = soso.map(new MapFunction<String, Tuple2<String, Long>>() {
             @Override
