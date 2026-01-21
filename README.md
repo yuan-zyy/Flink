@@ -552,9 +552,304 @@ public class Parallelism_Demo {
 
 #### 4.2.2 算子链（Operator Chain）
 
+![image-20260121221616574](E:\Idea\Idea_Study\Flink\image-20260121221616574.png)
+
+一个数据流在算子之间传输数据的形式可以是一对一（one-to-one）的直通（forwarding）模式，也可以是打乱的重分区（redistributing）模式，具体是哪一种取决于算子的种类
+
+#####  4.2.2.1 为什么需要啊算子链
+
+Flink 作业执行时，算子之间的数据传输有两种格式：
+
+1. **同一个Task内**：算子间数据直接在 JVM 内存中传递，无需序列化、网络IO、跨线程切换，效率极高
+
+2. **不同Task间**：数据需要经过序列化、通过网络（或本地管道）传输、在反序列化，还有任务调度的开销，性能的损耗
+
+   算子链的核心价值就是**减少跨Task的数据传输开销**，提升作业整体吞吐和降低延迟，这是 Flink 的默认优化策略（无需手动配置即可生效）
+
+##### 4.2.2.2 算子链的合并条件
+
+不是所有的算子都能合并成一个链，必须满足以下条件（核心条件）
+
+1. **上下游算子的并行度相同**：并行度不同的算子无法合并（比如上游并行度 5， 下游并行度 10， 必须要拆分 Task）
+2. **上下游算子之间是一对一（One-to-One）的数据流关系**：这种关系也叫**转发流（Forward Stream）**，即上游算子的输出直接转发给下游算子，数据不会被重分区（Shuffle）
+   - 符合的场景：map()、flatMap()、filter() 等无数据重分区的算子串联
+   - 不符合的场景：keyBy()、rebalance()、window() 等会触发数据重分区/Shuffle的操作，这些操作会打断链子
+3. **算子都在同一个执行环境（Execution Environment）中**，且属于同一个作业
+4. **算子的链策略（Chaining Strategy）允许合并**：每个算子都有对应的链策略，默认是允许合并
+5. **作业的整体并行执行模式（Exexction Mode）不是批处理的 "严格批处理模式"**（特殊场景，新手暂无需深入）
+
+##### 4.2.2.3 合并算子链
+
+​	在 Flink 中，**并行度相同的一对一（One-to-One）算子操作，可以直接链接在一起形成一个 “大” 的任务（Task）**，这样原来的算子就成为了真正任务里的一部分，如下图所示。每个 task 会被一个线程执行。这样的技术被称为 “算子链（Operator Chain）”
+
+##### 4.2.2.4 直观示例：算子链的表现
+
+比如下面这段简单的 Flink 代码
+
+```JAVA
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.source.SourceFunction;
+
+public class OperatorChainingDemo {
+    public static void main(String[] args) throws Exception {
+        // 1. 获取执行环境
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        // 保持默认并行度（通常为CPU核心数），便于观察算子链
+        env.setParallelism(2);
+
+        // 2. 构建数据流：source -> map -> filter -> print
+        env.addSource(new CustomSource())
+                .map(value -> "map处理后：" + value) // 算子1
+                .filter(value -> value.length() > 10) // 算子2
+                .print(); // 算子3
+
+        // 3. 执行作业
+        env.execute("Operator Chaining Demo");
+    }
+
+    // 自定义简单Source
+    static class CustomSource implements SourceFunction<String> {
+        private boolean isRunning = true;
+
+        @Override
+        public void run(SourceContext<String> ctx) throws Exception {
+            int count = 0;
+            while (isRunning) {
+                ctx.collect("数据" + count++);
+                Thread.sleep(1000);
+            }
+        }
+
+        @Override
+        public void cancel() {
+            isRunning = false;
+        }
+    }
+}
+```
+
+在 Flink Web UI 中查看这个作业的执行图（Job Graph），你会发现：
+
+- CustomSource、map、filter、print 会被合并成同一个 Task (因为满足所有合并条件)
+- 由于并行度设置为 2， 会生成 2 个完全相同的 Task 实例，各自独立处理一部分数据
+
+如果在代码中加入 keyBy() （会触发 Shuffle）比如：
+
+```JAVA
+env.addSource(new CustomSource())
+        .map(value -> "map处理后：" + value)
+        .keyBy(value -> value.length()) // 插入keyBy，打断算子链
+        .filter(value -> value.length() > 10)
+        .print();
+```
+
+此时的算子链会被拆分成两个 Task：
+
+1. Task1: CustomSource + map
+2. Task2：filter + print
+
+​	两者之间通过 Shuffle 传输数据，无法合并
+
+##### 4.2.2.5 算子链的禁用
+
+Flink 允许手动干预算子链的合并，满足特殊场景需求（比如调试、资源隔离），核心由3中操作
+
+1. **全局禁用算子链（整个作业）**
+
+   禁用后，所有算子都不会合并，每个算子都是一个独立的 Task，适合调试时排查问题
+
+   ```JAVA
+   // 获取执行环境后，调用该方法禁用全局算子链
+   env.disableOperatorChaining();
+   ```
+
+   
+
+2. **局部打断算子链（某个算子之后）**
+
+   在指定算子之后添加 startNewChain()，表示该算子之后的算子会开启一个新的算子链，当前算子与之前的算子仍会合并（局部拆分）
+
+   ```JAVA
+   env.addSource(new CustomSouorce())
+       .map(value -> "map处理之后：" + value)
+       .startNewChain() // map之后的算子开启新链
+       .filter(value -> value.length() > 10)
+       .print();
+   ```
+
+   此时会生成两个 Task：
+
+   - Task1：CustomSource + map
+   - Task2：filter + print
+
+3. **单个算子禁用合并（不参与任何算子链）**
+
+   给指定算子添加 disableChaining()，表示该算子独立成一个 Task，既不与前面的算子合并，也不与后面的算子合并
+
+   ```JAVA
+   env.addSource(new CustomSource())
+       .map(value -> "map处理后" + value)
+       .disableChining() // map 算子独立成 Task
+       .filter(value -> value.length() > 10)
+       .print()
+   ```
+
+   此时会生成三个 Task:
+
+   - Task1：CustomSource
+   - Task2：map（独立）
+   - Task3：filter + print
+
+##### 4.2.2.6 补充：算子链的底层本质
+
+1. 合并后的算子链，在执行时对应一个**SubTask(Flink 的最小执行单元)**，运行在一个独立的线程
+2. 算子链内部的算子，按照数据流顺序一次执行，数据采用 “流水线” 方式传递，无额外开销
+3. 算子链不会改变作业的业务逻辑，仅改变作业的执行拓扑（Task划分），是纯性能优化手段
+
+#### 4.2.3 任务槽（Task Slots）
+
+​	Flink 中每一个 TaskManager 都是一个 JVM 进程，它可以启动多个独立的线程，来并行执行多个子任务（subtask）
+
+​	很显然，TaskManager 的计算资源是有限的，并行的任务越多，每个线程的资源就会越少。那一个 TaskManager 到底能并行执行多少个任务呢？为了控制并发量，我们需要再 TaskManager 上对每个任务运行所占用的资源做出明确的划分，这就是所谓的<span style="color:red">**任务槽（Task Slots）**</span>
+
+​	每个任务槽（task slot）其实表示了 TaskManager 拥有计算资源的一个固定大小的子集。这些资源就是用来独立执行一个子任务的
 
 
 
+​	假设一个 TaskManager 有三个 slot ，那么他会将管理的内存平均分成三份，每个 slot 独自占一份。这样一来，我们**在 slot 上执行一个子任务时，相当于划定了一块内存 “专款专用”**，就**不需要跟来自其他作业的任务去竞争内存资源了**
 
-####  4.2.3 任务槽和并行度的关系
+​	所以现在我们**只要2个TaskManager**，就可以并行处理配好的 5 个任务了
+
+![image-20260122001758055](E:\Idea\Idea_Study\Flink\image-20260122001758055.png)
+
+##### 4.2.3.1 任务槽是什么
+
+**Task Slot 是 Flink 为 TaskManager 划分的最小资源单位**，可以把它理解成 TaskManager （Flink的工作节点），上的 “资源插槽”。每个 Task Slot 会独占 TaskManager 的一部分硬件资源（内存为主，CPU由TaskManager共享），用于运行任务
+
+**核心背景**：
+
+- 一个 TaskManager 是一个 JVM 进程，默认情况下，Flink 会给每个 TaskManager 分配 1 个 Slot，你也可以通过配置调整 Slot 数量（比如设置为4、8等）
+- 每个 Slot 对应 TaskManager 中固定比例的内存资源（总内存/Slot数），CPU则由所有 Slot 共享（Flink 1.10+ 支持CPU隔离，需结合YARN/K8s等资源管理器）
+
+##### 4.2.3.2 任务槽的作用
+
+1. **资源隔离**
+
+   Task Slot 最核心的作用是**内存隔离**
+
+   - 不同 Slot 中的任务不会共享 JVM 堆内存，避免一个任务的内存溢出影响其他任务
+   - 但同一 TaskManager 下的所有 Slot 会共享 JVM 的元空间（Metaspance）、线程池，减少资源开销
+
+2. **控制并行度**
+
+   Task Slot 的数量直接决定了 Flink 任务的**最大并行上限**：
+
+   - 整个集群的总 Slot 数 = 所有 TaskManager 的 Slot 数之和
+   - 任务的并行度（Parallelism）不能超过集群总 Slot 数（否则任务无法全部启动）
+
+3. **任务链（Operator Chain）优化**
+
+   Flink 会将上下游无数据 shuffle 的算子（比如 map + filter）合并成一个**任务链（Task Chain）**，一个任务链会运行在一个 Slot 中，减少线程切换和数据传输开销
+
+   - 示例：一个包含 Source -> map -> filter -> sink 的无 shuffle 作业，即使并行度为 4， 也只会占用 4 个 Slot （而非16个）
+
+##### 4.2.3.3 任务槽的配置与使用
+
+1. **配置 TaskManager 的 Slot 数**
+
+   有 3 中常见的配置方式：
+
+   **（1）配置文件（flink-conf.yaml）**
+
+   ```yam
+   # 每个 TaskManager 的默认 Slot 数（全局配置）
+   taskmanager.numberOfTaskSlots: 4
+   ```
+
+   **(2) 启动 TaskManager 时指定（命令行）**
+
+   ```BASH
+   # 启动单个 TaskManager 指定 Slot 数为 8
+   ./bin/taskmanager.sh start --slot 8
+   ```
+
+   **(3) 提交作业时指定（覆盖全局配置）**
+
+   ```BA
+   # 提交作业时，指定该作业使用的 Slot 数（实际是作业并行度）
+   ./bin/flink run -p 4 /path/to/your/job.jar
+   ```
+
+2. **关键示例：Slot 与并行度关系**
+
+   假设你有 2 个TaskManager，每个配置 3 个 Slot
+
+   - 集群总 Slot 数 = 2 * 3 = 6
+   - 如果你提交的作业并行度设置为 4
+     - 只会占用 4 个 Slot，剩余 2 个可运行其他作业
+     - 每个并行子任务（Subtask）会分配到一个独立的 Slot 中
+   - 如果你提交的作业并行度设置为 8
+     - 作业会处于 “待调度” 状态，直到集群新增 2 个 Slot （比如启动新的 TaskManager）
+
+##### 4.2.3.4 任务槽的常见误区
+
+1. **误区1：** 1个 Slot = 1 个 CPU 核心
+   - 错误：默认情况下 Slot 只隔离内存，CPU 是共享的。CPU 隔离需要结合资源管理器（如YARN配置 yarn.containers.vcores）
+2. **误区2：**：Slot 数越多越好
+   - 错误：Slot 数过多会导致单个 TaskManager 的内存被过度拆分（每个 Slot 内存过小），容易触发 OOM；Slot 数过少则会浪费资源
+   - 建议：根据 TaskManager 的内存大小配置 Slot 数（比如 16G 内存的 TaskManager，配置 4 个 Slot，每个 Slot 分配 4G 内存）
+3. **误区3：**作业并行度必须等于 Slot 数
+   - 错误：并行度可以小于 Slot 数（资源富裕），也可以通过动态扩容 Slot 来满足更大的并行度需求
+
+
+
+####  4.2.4 任务槽和并行度的关系
+
+​	**任务槽和并行度都跟程序的并行执行有关，但两者是完全不同的概念**。简单来说**任务槽是静态的概念**，是指 TaskManager 具有的并发执行能力，可以通过参数进行配置；而并行度是动态的概念，也就是 TaskManager 运行程序时实际使用的并发能力
+
+​	举例说明：standalone 的会话模式，假设一共有 3 个 TaskManager，每一个 TaskManager 中的 slot 数量设置为 3 个，那么一共有 9 个 task slot，表示集群最多能并行执行 9 个统一算子的任务
+
+​	而我们定义 word count 程序的处理操作是四个转换算子
+
+​	source -> flatmap -> reduce -> sink
+
+​	当所有算子并行度相同时，容易看出 source 和 flatmap 可以合并为 算子链，于是最终有三个任务节点
+
+
+
+## 第5章 DataStream API
+
+### 5.1 执行环境（Execution Environment）
+
+
+
+### 5.2 源算子（Source）
+
+
+
+### 5.3 转换算子（Transformation）
+
+
+
+### 5.4 输出算子（Sink）
+
+
+
+## 第6章 Flink中的时间和窗口
+
+
+
+## 第7章 处理函数
+
+
+
+## 第8章 状态管理
+
+
+
+## 第9章 容错机制
+
+
+
+## 第10章 Flink SQL
 
