@@ -11,6 +11,7 @@
     <modules>
         <module>chapter02-introduction</module>
         <module>chapter04-architecture</module>
+        <module>chapter05-data-stream-api</module>
     </modules>
 
     <properties>

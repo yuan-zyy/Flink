@@ -819,15 +819,1190 @@ Flink 允许手动干预算子链的合并，满足特殊场景需求（比如�
 
 ## 第5章 DataStream API
 
+![image-20260124232436426](E:\Idea\Idea_Study\Flink\image-2026012423243642644.png)
+
 ### 5.1 执行环境（Execution Environment）
 
+#### 5.1.1 核心概念
 
+Flink 执行环境（ExecutionEnvironment 或 StreamExecutionEnvironment）的核心作用可以概括为3点：
+
+1. **初始化上下文**：为 Flink 应用创建一个运行上下文、加载配置（并行度、状态后端等），关联底层集群资源（本地、YARN、K8s等）
+2. **创建数据源**：通过执行环境提供的 API 读取外部数据（文件、Kafka、MySQL等），生成 Flink 最核心的 DataSet（批处理）或 DataStream（流处理）
+3. **提交执行任务**：触发应用的执行（调用 execute()），将业务逻辑转换成 Flink 的 JobGraph，提交给集群（或本地）运行
+
+注意：Flink 1.12 之后引入了**统一流批处理(Unified Btach & Stream Procession)**，推荐使用 StreamExecutionEnvironment 同时支持流处理和批处理（通过配置执行模式切换），传统的 ExecutionEnvironment（仅批处理）逐渐被弱化
+
+#### 5.1.2 执行环境的 3 种核心分类
+
+根据运行部署的环境不同，Flink 提供了 3 种常用执行环境创建方式，满足开发测试、生产部署等不同场景
+
+1. **本地执行环境（Local Execution Environment）**
+
+   用于**本地开发、调试和单元测试**，不需要搭建 Flink 集群，直接在当前 JVM 中运行任务，资源可控
+
+   **核心创建方式：**
+
+   ```JAVA
+   public class LocalEnvDemo {
+   
+       public static void main(String[] args) throws Exception {
+           // 方式1: 创建默认本地之心环境（并行度默认等于当前机器的 CPU 核心数）
+           LocalStreamEnvironment env1 = StreamExecutionEnvironment.createLocalEnvironment();
+           
+           // 方式2: 指定并行度的本地执行环境（推荐，调试时并行度可控，避免混乱）
+           LocalStreamEnvironment env2 = StreamExecutionEnvironment.createLocalEnvironment(2);
+           
+           // 方式3: 带配置的本地执行环境（可配置更多参数，如状态后端、内存等）
+   //        Configuration conf = new Configuration();
+   //        conf.setInteger("state.backend.rocksdb.memory.off-heap", 1);
+   //        LocalStreamEnvironment env3 = StreamExecutionEnvironment.createLocalEnvironment(2, conf);
+           
+           // 后续业务逻辑（示例：读取本地文件）
+           env1.readTextFile("file:///tmp/test.txt")
+                   .print();
+           
+           // 提交作业（本地环境，execute()）会直接触发运行
+           env2.execute("Local Flink Job Demo");
+       }
+   
+   }
+   ```
+
+   **关键特性**：
+
+   - 无需集群，开箱即用，适合开发阶段
+   - 支持断点调试，能直观看到任务运行的结果
+   - 资源有限（受当前机器限制），不适合大规模数据测试
+
+2. **集群执行环境（Cluster Execution Environment）**
+
+   用于**生产环境配置**，任务会提交到已搭建好的 Flink 集群（Standalone、YARN、K8s等）运行，充分利用集群资源
+
+   **核心创建方式**
+
+   集群环境不需要手动指定**集群地址**，而是通过 getExecutionEnvironment() 自动适配，这也是**生产环境的推荐写法**（保证代码的可移植性，无需修改代码即可在不同环境运行）
+
+   ```java
+   import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+   
+   public class ClusterEnvDemo {
+       public static void main(String[] args) throws Exception {
+           // 核心方法：自动获取执行环境
+           // 规则：
+           // 1. 若本地运行（无集群提交），等价于 getLocalEnvironment()
+           // 2. 若通过 flink run 提交到集群，等价于集群执行环境
+           StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+           
+           // 配置全局并行度（可选，可被集群配置覆盖）
+           env.setParallelism(4);
+           
+           // 后续业务逻辑（示例：读取 Kafka 数据）
+           // Properties kafkaProps = new Properties();
+           // kafkaProps.setProperty("bootstrap.servers", "kafka-node1:9092");
+           // kafkaProps.setProperty("group.id", "flink-cluster-group");
+           // env.addSource(new FlinkKafkaConsumer<>("test_topic", new SimpleStringSchema(), kafkaProps))
+           //    .print();
+           
+           // 提交任务（集群环境下，execute() 会将 JobGraph 提交给集群 JobManager）
+           env.execute("Cluster Flink Job Demo");
+       }
+   }
+   ```
+
+   **提交到集群的命令（示例：Standalone 集群）**
+
+   ```bash
+   # 打包后提交（jar 包需要包含所有依赖，或使用 Flink 提供的依赖）
+   ./bin/flink run -c com.example.ClusterEnvDemo /path/to/your/flink-job.jar
+   ```
+
+   **关键特性**
+
+   - 自动适配部署环境，代码可移植性强
+   - 充分利用集群资源，支持大规模数据处理和高可用
+   - 需提前搭建和配置 Flink 集群，依赖集群环境
+
+3. **远程执行环境（Remote Execution Environment）**
+
+   手动指定远程集群的 JobManager 地址，直接将任务提交到远程集群运行，**较少用于生产环境**（灵活性低，不如 getExecutionEnvironment() 适配性好），偶尔用于本地直接提交任务到测试集群
+
+   **核心创建方式**
+
+   ```JAVA
+   
+   public class RemoteEnvDemo {
+   
+       public static void main(String[] args) throws Exception {
+           // 创建远程执行环境，指定 JobManager 的地址、端口、并行度、依赖 Jar 包
+           StreamExecutionEnvironment env = StreamExecutionEnvironment.createRemoteEnvironment(
+                   "192.168.1.1", // JobManager 主机名/IP
+                   8081,               // JobManager RPC 端口（默认 8081）
+                   2,                  // 全局并行度
+                   "xxx.jar"  // 任务依赖的 jar 包（可选）
+           );
+   
+           // 后端业务逻辑
+           env.readTextFile("hdfs://192.168.1.1:9000/data/input.txt")
+                   .print();
+           
+           // 提交任务（直接提交到指定的远程 JobManager）
+           env.execute("Remote Flink Job Demo");
+       }
+       
+   }
+   ```
+
+   **关键特性**
+
+   - 手动指定集群地址，灵活性低，代码与集群耦合
+   - 本地无需打包，可直接提交远程集群，适合快速测试集群环境
+   - 需保证本地与远程的网络互通，依赖 jar 包需一致
+
+#### 5.1.3 执行环境的核心常用 API
+
+不管哪种执行环境，都提供了一系列的通用 API，用于配置任务和创建数据源，这里列举最核心的几个：
+
+1. **配置相关 API**
+
+   - **setParallelism(int parallelism)**：设置全局并行度（可被算子级并行度、集群配置覆盖）
+   - **setMaxParallelism(int maxParallelism)**：设置最大并行度（用于任务扩容时的并行度调整，避免状态迁移问题）
+   - **enableCheckpointing(long interval)**：开启检查点（流处理容错核心），指定检查点间隔（毫秒）
+   - **setStateBackend(StateBackend stateBackend)**：设置状态后端（用于存储任务状态，如 RocksDBStateBackend）
+   - **getConfig**：获取执行环境配置对象，可配置更多细节（如超时时间、序列化方式）
+
+2. **数据源创建 API（核心）**
+
+   - **`readTextFile(String path)`**：读取文本文件（本地文件、HDFS 等）。
+
+   - **`fromCollection(Collection<T> collection)`**：从 Java 集合中读取数据（仅用于测试，不支持大规模数据）。
+
+   - **`fromElements(T... elements)`**：直接从指定元素中创建数据源（仅用于测试）。
+
+   - **`addSource(SourceFunction<T> source)`**：添加自定义数据源（或内置数据源，如 Kafka、Redis 等），流处理的核心数据源方式
+
+3. **任务提交 API**
+
+   - **`execute(String jobName)`**：提交任务并阻塞等待执行完成，返回任务执行结果（`JobExecutionResult`），包含任务耗时、并行度等信息。
+
+   - **`executeAsync(String jobName)`**：异步提交任务，不阻塞当前线程，返回 `JobClient`，可用于后续查询任务状态（Flink 1.14+ 支持）
+
+#### 5.1.4 执行模式
+
+**统一流批处理的执行模式切换**：Flink 1.12+ 中，`StreamExecutionEnvironment` 支持通过 `setRuntimeMode(RuntimeExecutionMode mode)` 切换执行模式
+
+- `STREAMING`：流处理模式（默认，处理无界流，实时计算）。
+- `BATCH`：批处理模式（处理有界流，类似传统 MapReduce，结果一次性输出）。
+
+- `AUTOMATIC`：自动判断（根据数据源是否有界，自动切换流 / 批模式）
+
+
+
+设置执行模式有两种方式：
+
+1. 代码设置 `setRuntimeMode(RuntimeExecutionMode mode)`
+
+2. 在提交作业的时候，通过参数指定
+
+   ```bash
+   -Dexecution.runtime-mode=BATCH
+   ```
+
+#### 5.1.5 关键注意点（避坑指南）
+
+1. **一个应用只能有一个执行环境**：Flink 应用中，`StreamExecutionEnvironment` 或 `ExecutionEnvironment` 只能创建一个，多个执行环境会导致冲突和异常。
+
+2. **`execute()` 是任务执行的触发点**：Flink 应用的逻辑是「惰性执行」的，只有调用 `execute()` 方法，才会将之前定义的算子、数据源等转换成 JobGraph 并提交运行，不调用 `execute()` 则任务不会执行。
+
+3. **统一流批处理的执行模式切换**：Flink 1.12+ 中，`StreamExecutionEnvironment` 支持通过 `setRuntimeMode(RuntimeExecutionMode mode)` 切换执行模式：
+
+   - `STREAMING`：流处理模式（默认，处理无界流，实时计算）。
+   - `BATCH`：批处理模式（处理有界流，类似传统 MapReduce，结果一次性输出）。
+
+   - `AUTOMATIC`：自动判断（根据数据源是否有界，自动切换流 / 批模式）
+
+4. **本地环境与集群环境的资源隔离**：本地环境运行时，不要处理大规模数据，避免占用过多本地资源导致 OOM；集群环境运行时，需注意配置资源（内存、CPU）与集群节点的匹配
 
 ### 5.2 源算子（Source）
 
+​	Flink 可以从各种来源获取数据，然后构建 DataStream 进行转换处理，一般将数据的输入来源称之为 （Data Source），而读取数据的算子就是**源算子（Source Operator）**。所以，Source就是我们整个处理程序的输入端
 
+​	在 Flink 1.12 以前，旧的添加 Source 的方式是调用执行环境的 addSource() 方法：
+
+`DataStream<String> stream = env.addSource(...)`;
+
+​	方法传入的参数是一个 “源函数”（Source Function），需要实现 SourceFunction 接口
+
+​	从 Flink 1.12 开始，主要使用流批一体的新 Source 架构：
+
+`DataStreamSource<String> stream = env.fromSource(...)`
+
+​	Flink 直接提供了很多预实现的接口，才外还有很多外部连接工具也帮我们实现了对应的 Source，通常情况下足以应对我们的实际需求
+
+#### 5.2.1 核心概念
+
+1. **Source算子的作用**：作为 Flink 作业的 “数据输入端”，负责连接外部数据源、读取/采集数据，并将数据封装为 Flink 内部的 `DataStream`(流处理) 或 `Table`/`DataStream`(批处理，Flink 批流一体)，供后续转换（Transform）、输出（Sink）算子处理
+2. **批流一体特性**：Flink 1.23+ 实现了批流一体，`Source`也支持批处理场景（如读取本地文件、HDFS静态文件）和流处理场景（如读取Kafka、CDC实时数据），底层通过统一的 `SourceFunction` 或 `Source` 接口实现
+3. **核心接口**：
+   - **低阶接口（早期实现，多用于简单场景）**：`SourceFunction`（无并行度，单线程）、`ParallelSourceFunction`（支持并行度）、`RichParallelSourceFunction`（扩展了生命周期方法，如 `open`/`close`，支持资源初始化/释放）
+   - **高阶接口（Flink 1.14+推荐，批流一体、支持更丰富特性）**：`Source` （统一批流接口）、`StreamSource`（流场景封装），配套 `SourceBuilder` 简化构建
+
+#### 5.2.2 源算子分类
+
+按照数据源的类型和使用场景，可分为 3 大类，覆盖绝大数实际开发需求
+
+##### 5.2.2.1 内置基础数据源（用于简单测试/本地调试）
+
+主要用于测试、简单场景，支持批/流模式，核心包括一下集中
+
+1. **从集合读取（fromCollection）**
+
+   读取内存的 Java/Scala 集合（如 List、Set），**多用于本地测试**，不适合生产环境（数据量有限、无持久化）
+
+   ```java
+   import org.apache.flink.streaming.api.datastream.DataStreamSource;
+   import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+   import java.util.Arrays;
+   import java.util.List;
+   
+   public class CollectionSourceDemo {
+       
+       public static void main(String[] args) throws Exception {
+           // 1. 获取执行环境
+           StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+           // 设置并行度（默认并行度为 CPU 核心数）
+           env.setParallelism(1);
+           
+           // 2. 从 List 集合创建 Source
+           List<String> dataList = Arrays.asList("Flinks", "Source", "Collection", "Demo");
+           DataStreamSource<String> ds = env.fromCollection(dataList);
+           
+           // 3. 打印输出（Sink）
+           ds.print("Collection Source:");
+           
+           // 4. 执行作业（Flink 作业必须显式执行）
+           env.execute("CollectionSourceDemo");
+       }
+       
+   }
+   
+   ```
+
+   输出结果（按集合顺序输出）：
+
+   ```tex
+   Collection Source:> Flink
+   Collection Source:> Source
+   Collection Source:> Collection
+   Collection Source:> Demo
+   ```
+
+   
+
+2. **从元素直接创建（fromElements）**
+
+   无需封装集合，直接传入多个离散元素，**测试场景比 fromCollection 更简洁**
+
+   ```java
+   // 替代 fromCollection，直接传入元素
+   DataStream<String> dataStream = env.fromElements("Flink", "Source", "Elements", "Demo");
+   ```
+
+3. **从文件读取（readTextFile/readFile）**
+
+   读取本地文件或分布式文件系统（HDFS、S3等），支持批模式（读取静态文件，一次性读取完毕）和流模式（监控文件目录，读取新增文件/新增内容）
+
+   - **批模式（默认）**：读取指定文件的全部内容，适合处理静态数据
+
+     ```java
+     // 读取本地文件（也可传入 hdfs://xxx/xxx.txt，读取 HDFS 文件）
+     DataStream fileStream = env.readTextFile("src/main/resources/test.txt");
+     ```
+
+   - **流模式：通过 readFile 配置监控策略，适合处理增量文件数据**
+
+     ```java
+     import org.apache.flink.core.fs.Path;
+     import org.apache.flink.streaming.api.functions.source.FileProcessingMode;
+     import java.util.concurrent.TimeUnit;
+     
+     // 流模式：监控指定目录，每 10 扫描一次新增文件/新增内容
+     DataStream<String> fileStream = env.readFile(
+     	org.apache.flink.api.common.io.TextInputFormat.class, // 文件输入格式（文本文件默认）
+         "src/main/resources/file-dir",	// 监控目录
+         FileProcessingMode.PROCESS_CONTINUOUSLY, // 流处理模式（持续监控）
+         TimeUnit.SECONDS.toMillis(10)	// 扫描间隔
+     )
+     ```
+
+   - **批流一体（File Source）**
+
+     ```java
+     import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+     import org.apache.flink.connector.file.src.FileSource;
+     import org.apache.flink.connector.file.src.reader.TextLineInputFormat;
+     import org.apache.flink.core.fs.Path;
+     import org.apache.flink.streaming.api.datastream.DataStreamSource;
+     import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+     
+     public class FileSourceDemo {
+         public static void main(String[] args) throws Exception {
+             // 1. 获取执行环境
+             StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+             env.setParallelism(1);
+             
+             // 2. 构建 File Source（读取文本文件，支持本地文件/HDFS）
+             FileSource<String> fileSource = FileSource.forRecordStreamFormat(
+                     new TextLineInputFormat(),  // 输入格式：按行读取文本
+                     new Path("data/input/demo.txt") // 文件路径
+             ).build();
+             
+             // 3. 构建数据流
+             DataStreamSource<String> fileStream = env.fromSource(
+                     fileSource,
+                     WatermarkStrategy.noWatermarks(),
+                     "File Source Demo"
+             );
+             
+             // 4. 打印输出
+             fileStream.print("FileStream:");
+             
+             // 5. 执行作业
+             env.execute("FileSourceDemo");
+         }
+     }
+     ```
+
+4. **从 Socket 读取（socketTextStream）**
+
+   读取 Socket 端口发送的数据，**多用于本地实时测试**（生产环境不推荐，无容错、无持久化）
+
+   ```bash
+   # 先在终端启动 Socket 服务（Linux/Mac）
+   nc -lk 9999
+   ```
+
+   ```java
+   // 连接本地 9999 端口，读取 Socket 数据
+   DataStream<String> socketStream = env.socketTextStream("localhost", 9999);
+   ```
+
+   此时在终端输入内容，Flink 作业会实时接收并打印
+
+##### 5.2.2.2 第三方连接器数据源（生产环境主流）
+
+针对生产环境中的常用数据（如 Kafka、MySQL CDC、HBase等），Flink 提供了专用的连接器（Connector），需要引入额外的 Maven 依赖，支持高可用、容错、并行读取等生产级特性
+
+1. **Kafka Source（最常用，流处理核心）**
+
+   Flink 提供了两个版本的 Kafka 连接器
+
+   - 旧版：基于 `FlinkKafkaConsumer`（实现 `SourceFunction`），兼容低版本 Flink
+   - 新版：Flink 1.14+ 推出的 `KafkaSource`（基于统一 `Source` 接口，批流一体，推荐生产环境使用 ）
+
+   下面是新版 `KafkaSource` 的完整实例（依赖 Flink 1.17+）
+
+   **第一步：引入 Maven 依赖**
+
+   ```xml
+   <!-- Flink Kafka 连接器（核心） -->
+   <dependency>
+       <groupId>org.apache.flink</groupId>
+       <artifactId>flink-connector-kafka</artifactId>
+       <version>1.17.0</version>
+   </dependency>
+   <!-- Kafka 客户端（需与 Kafka 集群版本兼容） -->
+   <dependency>
+       <groupId>org.apache.kafka</groupId>
+       <artifactId>kafka-clients</artifactId>
+       <version>3.2.0</version>
+   </dependency>
+   ```
+
+   **第二部：编写代码**
+
+   ```java
+   import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+   import org.apache.flink.api.common.serialization.SimpleStringSchema;
+   import org.apache.flink.connector.kafka.source.KafkaSource;
+   import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
+   import org.apache.flink.streaming.api.datastream.DataStreamSource;
+   import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+   
+   public class KafkaSourceDemo {
+       public static void main(String[] args) throws Exception {
+           // 1. 获取执行环境
+           StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+           // KafkaSource 支持并行读取数据（并行度 <= Kafka 分区数）
+           env.setParallelism(2);
+           
+           // 2. 构建 KafkaSource
+           KafkaSource<String> kafkaSource = KafkaSource.<String>builder()
+                   .setBootstrapServers("192.168.1.1:9092") // Kafka 集群地址
+                   .setTopics("test")  // 要消费的主体
+                   .setGroupId("test") // 消费者组 ID
+                   // 设置初始偏移量: earliest(从最早开始)、latest(从最新开始)、specific(指定偏移量)、committed(已提交的)
+                   .setStartingOffsets(OffsetsInitializer.earliest())
+                   // 设置反序列器（将 Kafka 消息转化为 Flink 可处理的 String 类型）
+                   .setValueOnlyDeserializer(new SimpleStringSchema())
+                   .build();
+           
+           // 3. 从 Kafka Source 创建 DataStream
+           DataStreamSource<String> kafkaStream = env.fromSource(
+                   kafkaSource, 
+                   WatermarkStrategy.noWatermarks(), // 水印策略（简单场景无需水印）
+                   "Kafka Source");    // Source 名称（便于监控）
+           
+           // 4. 打印输出
+           kafkaStream.print("Kafka Source:");
+           
+           // 5. 执行作业
+           env.execute("KafkaSourceDemo");
+       }
+   }
+   
+   ```
+
+   
+
+2. **CDC Source（读取数据库变更数据，如MySQL、PostgreSQL）**
+
+   **CDC（Change Data Capture）**用于捕获数据库的增删改查（INSERT/UPDATE/DELETE）变更，是实时数据同步，数仓建设的核心场景，Flink 提供了 `flink-connector-cdc`连接器，基于 Debezium 实现
+
+   示例（MySQL CDC Source，Flink 1.17+）
+
+   **Maven依赖**
+
+   ```xml
+   <dependency>
+       <groupId>com.ververica</groupId>
+       <artifactId>flink-connector-mysql-cdc</artifactId>
+       <version>2.4.0</version>
+   </dependency>
+   ```
+
+   ```java
+   
+   import com.ververica.cdc.connectors.mysql.source.MySqlSource;
+   import com.ververica.cdc.debezium.JsonDebeziumDeserializationSchema;
+   import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+   import org.apache.flink.streaming.api.datastream.DataStreamSource;
+   import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+   
+   public class MysqlCdcSourceDemo {
+   
+       public static void main(String[] args) throws Exception {
+           // 1. 获取执行环境
+           StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+           env.setParallelism(1); // MySQL CDC Source 目前不支持并行读取（单并行度）
+   
+           // 2. 构建 MySQL CDC Source
+           MySqlSource<String> mySqlCdcSource = MySqlSource.<String>builder()
+                   .hostname("192.168.1.1")    // MySQL 地址
+                   .port(3306)                 // MySQL 端口
+                   .username("root")           // MySQL 用户名
+                   .password("<PASSWORD>")     // MySQL 密码
+                   .databaseList("test")       // 要监控的数据库
+                   .tableList("test.user")     // 要监控的表（格式：数据库.表）
+                   .deserializer(new JsonDebeziumDeserializationSchema())  // 反序列为 JSON 字符串
+                   .build();
+           
+           // 3. 从 CDC Source 创建 DataStream
+           DataStreamSource<String> cdcStream = env.fromSource(mySqlCdcSource, WatermarkStrategy.noWatermarks(), "MySQL CDC Source");
+           
+           // 4. 打印输出
+           cdcStream.print();
+           
+           // 5. 执行作业
+           env.execute("MysqlCdcSourceDemo");
+       }
+   ```
+
+   当 `tast_db.test` 表发生数据变更时，Flink 会实时捕获并输出变更信息（包括操作类型、旧数据、新数据）
+
+##### 5.2.2.3  <span style="color:red">**自定义 Source （满足特殊场景需求）**</span>
+
+当内置数据源和第三方连机器无法满足需求时（如读取自定义协议的设备数据、私有系统接口数据），可以通过实现 Flink 提供的 Source 接口来定义 Source。
+
+**推荐两种实现方式**：
+
+1. **低阶实现：RichParallelSourceFunction（简单场景，易于理解）**
+
+   实现 `run()`方法（数据生成/读取逻辑）和 `cancel()` 方法（取消作业时的资源释放逻辑），`Rich` 前缀提供了 `open()`/`close()` 生命周期方法
+
+   示例：自定义一个生成递增数字的 Source （每秒生成一个数字）
+
+   ```java
+   import org.apache.flink.streaming.api.datastream.DataStreamSource;
+   import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+   import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
+   
+   public class CustomSourceDemo {
+       public static void main(String[] args) throws Exception {
+           // 1. 获取执行环境
+           StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+           env.setParallelism(1);
+           
+           // 2. 自定义数据源
+           DataStreamSource<Long> myCustomSource = env.addSource(new MyCustomSource(), "MyCustomSource");
+           
+           // 3. 打印输出
+           myCustomSource.print("Custom Souorce:");
+           
+           // 4. 执行作业
+           env.execute("CustomSourceDemo");
+       }
+       
+       // 自定义 Source: 实现 RichParallelSourceFunction
+       public static class MyCustomSource extends RichParallelSourceFunction<Long> {
+           // 标记是否继续运行（用于取消作业时终止循环）
+           private volatile boolean isRunning = true;
+           // 递增数字
+           private long count = 0;
+           
+           @Override
+           public void run(SourceContext<Long> ctx) throws Exception {
+               while (isRunning) {
+                   // 加锁写入数据（保证并发场景下的数据一致性）
+                   synchronized (ctx.getCheckpointLock()) {
+                       ctx.collect(count); // 发送数据到下游算子
+                       count++;
+                   }
+                   // 每秒生产一个数据
+                   Thread.sleep(1000);
+               }
+           }
+   
+           @Override
+           public void cancel() {
+               // 取消作业时，将标记设置为 false，终止 run() 方法中的循环
+               isRunning = false;
+           }
+       }
+   }
+   
+   ```
+
+   输出结果：每秒输出一个递增的数字，停止作业时会触发 `cancel()` 方法释放资源
+
+2. <span style="color:red">**高阶实现：Source（Flink 1.14+ 推荐，批流一体）**</span>
+
+   基于 `SourceBuilder` 构建，支持更丰富的的特性（如 分区发现、水印生成、容错优化），适合复杂生产场景，步骤相对繁琐，这里不展开细节，核心思路是实现 `SplitEnumerator`（分区枚举，分配任务）和 `Reader` （数据读取，处理单个分区数据）
+
+#### 5.2.3 从数据生成器读取数据
+
+Flink 从 1.11 开始提供了一个内置的 DataGen 连接器，主要是用于生成一些随机数，用于在没有数据源的时候，进行流任务的测试以及性能测试等。1.17 提供了新的 `Source` 写法，需要导入依赖
+
+```xml
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.connector.source.util.ratelimit.RateLimiterStrategy;
+import org.apache.flink.connector.datagen.source.DataGeneratorSource;
+import org.apache.flink.connector.datagen.source.GeneratorFunction;
+import org.apache.flink.streaming.api.datastream.DataStreamSource;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+
+public class DataGenSimpleDemo {
+    public static void main(String[] args) throws Exception {
+        // 创建执行环境
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(1);
+
+        DataGeneratorSource<String> generatorSource = new DataGeneratorSource<>(new GeneratorFunction<Long, String>() {
+            @Override
+            public String map(Long value) throws Exception {
+                return "数据 -> " + value;
+            }
+        }, 
+                100,
+                RateLimiterStrategy.perSecond(10),
+                TypeInformation.of(String.class));
+
+        DataStreamSource<String> dataStreamSource = env.fromSource(
+                generatorSource,
+                WatermarkStrategy.noWatermarks(),
+                "DataGen Source"
+        );
+
+        dataStreamSource.print();
+        env.execute();
+    }
+}
+```
+
+#### 5.2.4 Flink 支持的数据类型
+
+1. **Flink 的类型系统**
+
+   Flink 使用 “类型信息” （TypeInformation）来统一表示数据类型。TypeInfomation 类是 Flink 中所有类型描述符的基类。它涵盖了类型的一些基本属性，并为每个数据类型生成特定的序列化器、反序列化器和比较器
+
+2. **Flink 支持的数据类型**
+
+   对于常见的 Java 和 Scala 数据类型，Flink 都是支持的。Flink 在内部，Flink 对支持不同的类型进行了划分，这些类型可以在 Types 工具类中找到
+
+   - 基本类型
+
+     所有 Java 基本类型及其包装类，再加上 Void、String、Date、BigDecimal 和 BigInteger
+
+   - 数组类型
+
+     包括基本数据数据（PRIMITIVE_ARRAY） 和对象数组（OBJECT_ARRAY）
+
+   - 复合数据类型
+
+     - Java 元组类型（TUPER）：这是 Flink 内置的元组类型，是 Java API 的一部分，最多25个字段，也就是从 Tuple0 ~ Tuple25，不支持空字段
+     - Scala 样例类及 Scala 组：不支持空字段
+     - 行类型（ROW）：可以认为是具有任意字段的元组，并支持空字段
+     - POJO：Flink 自定义的类似于 Java Bean 模式的类
+
+   - 辅助类型
+
+     Option、Either、List、Map等
+
+   - 泛型类型（GENERIC）
+
+     ​	Flink 支持所有 Java 类和 Scala 类。不过如果没有按照上面 POJO 类型的要求来定义，就会被 Flink 当做泛型类来处理。Flink 会把泛型类型当做黑盒，无法获取它们内部的属性；它们也不是由 Flink 本身序列化的，**而是由 Jryo 序列化的**
+
+     ​	在这些类型中，元组类型和 POJO 类型最为灵活，因为它们支持创建复杂类型。而相比之下，POJO 还支持在键（key）的定义中直接使用字段名，这会让我们的代码可读性大大增加。所以，在项目实践中，往往会将流处理程序的元素类型定位 Flink 的 POJO 类型
+
+     **Flink 对 POJO 类型的要求如下：**
+
+     - 类是公有（public）的
+     - 有一个无参的构造函数
+     - 所有属性都是公有（public）的
+     - 所有属性都是可以序列化的
+
+3. 类型提示（Type Hints）
+
+   ​	Flink 还具有一个类型提取系统，可以分析函数的输入和返回类型，自动获取类型信息，从而获得对应的序列化器和反序列化器。但是，由于 Java 中泛型的擦除的存在，在某些特殊情况下（比如 Lambda 表达式），自动提取的信息是不够精细的 -- 只告诉 Flink 当前的元素由 “船头、船身、船尾”构成，根本无法重建出 “大船” 的模样；这时就需要显式地提供类型信息，才能使应用程序正常工作或提高其性能
+
+   ​	为了解决这类问题，Java API 提供了专门的 “类型提示”（type hints）
 
 ### 5.3 转换算子（Transformation）
+
+#### 5.3.1 基本转换算子（map/filter/flatMap）
+
+##### 5.3.1.1 映射（map）
+
+- **功能**：对数据流重大**每一个元素**进行一对一的转换，输入一个元素，输出一个元素
+
+- **数据场景**：数据格式转换、字段提取、简单值修改（如类型转换、数值计算）
+
+- **代码示例**：
+
+  ```java
+  import org.apache.flink.streaming.api.datastream.DataStream;
+  import org.apache.flink.streaming.api.datastream.DataStreamSource;
+  import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+  
+  public class MapOperatorDemo {
+      public static void main(String[] args) throws Exception {
+          // 1. 获取执行环境
+          StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+          env.setParallelism(1);
+          
+          // 2. 构建输入数据流
+          DataStreamSource<Integer> inputStream = env.fromElements(1, 2, 3, 4, 5);
+          
+          // 3. 适用 Map 算子：将每个整数乘以2（一对一转换）
+          DataStream<Integer> map = inputStream.map(x -> x * 2);
+          
+          // 4. 打印输出
+          map.print("map算子输出");
+          
+          // 5. 执行任务
+          env.execute();
+      }
+  }
+  ```
+
+- 输出结果
+
+  ```te
+  map算子输出> 2
+  map算子输出> 4
+  map算子输出> 6
+  map算子输出> 8
+  map算子输出> 10
+  ```
+
+##### 5.3.1.2 过滤（filter）
+
+- **功能**：对数据流中的每个元素进行条件判断，**保留满足条件的元素**，过滤掉不满足条件的元素
+
+- **适用场景**：数据清洗（如过滤空值、过滤不符合业务规则的数据）
+
+- **代码示例**：
+
+  ```java
+  import org.apache.flink.streaming.api.datastream.DataStream;
+  import org.apache.flink.streaming.api.datastream.DataStreamSource;
+  import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+  
+  public class FilterOperatorDemo {
+      public static void main(String[] args) throws Exception {
+          StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+          env.setParallelism(1);
+  
+          DataStreamSource<Integer> inputStream = env.fromElements(1, 2, 3, 4, 5, 6);
+          
+          // filter 算子：保留偶数（满足 num % 2 == 0 的元素）
+          DataStream<Integer> filter = inputStream.filter(num -> num % 2 == 0);
+          
+          filter.print("filter算子输出");
+          env.execute();
+      }
+  }
+  ```
+
+- 输出结果
+
+  ```te
+  filter算子输出> 2
+  filter算子输出> 4
+  filter算子输出> 6
+  filter算子输出> 8
+  ```
+
+##### 5.3.1.3 扁平映射（flatMap）
+
+-  **功能**：对数据流中的**每一个元素**进行一对多的转换，输出一个元素，输出 0 个、1个或多个元素（以集合/迭代器形式返回）
+
+- **适用场景**：数据拆分（如一行文本拆分成多个单词）、数据过滤（输出0个元素即过滤掉该输入）
+
+- **代码示例（文本拆分）**：
+
+  ```java
+  import org.apache.flink.api.common.functions.FlatMapFunction;
+  import org.apache.flink.streaming.api.datastream.DataStream;
+  import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
+  import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+  import org.apache.flink.util.Collector;
+  
+  public class FlatMapOperatorDemo {
+      public static void main(String[] args) throws Exception {
+          StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+          env.setParallelism(1);
+          
+          // 输入数据流：两行文本
+          DataStream<String> inputStream = env.fromElements("hello world", "hello flink");
+          
+          // flatMap算子：将每行文本按空格拆分，输出单个单词
+          SingleOutputStreamOperator<String> resultStream = inputStream.flatMap(new FlatMapFunction<String, String>() {
+              @Override
+              public void flatMap(String s, Collector<String> collector) throws Exception {
+                  // 拆分文本
+                  String[] words = s.split(" ");
+                  // 遍历拆分结果，逐个输出
+                  for (String word : words) {
+                      collector.collect(word);
+                  }
+              }
+          });
+          
+          resultStream.print("flatMap算子输出");
+          env.execute("FlatMap Operator Demo");
+      }
+  }
+  ```
+
+- 输出结果
+
+  ```tex
+  flatMap算子输出> Hello
+  flatMap算子输出> Flink
+  flatMap算子输出> Hello
+  flatMap算子输出> Big
+  flatMap算子输出> Data
+  ```
+
+##### 5.3.1.4 flatMap + filter 组合（常用）
+
+实际开发中常将两者组合使用，先拆分在过滤，例如：过滤拆分后的空单词
+
+
+
+#### 5.3.2 聚合算子（Aggregation）
+
+这类算子用于对数据流中的元素进行聚合计算，**通常需要结合 【键（key）】适用**（即先分区，再聚合），无键聚合仅适用于特殊场景（如全局聚合，不推荐大规模流处理中使用）
+
+![](E:\Idea\Idea_Study\Flink\image-2026012517255980633.png)
+
+##### 5.3.2.1 按键分组（keyBy）
+
+`keyBy` 不是聚合算子，但它是绝大多数聚合算子的前置操作：
+
+- **功能**：根据指定的**键（key）**将数据划分成多个逻辑分区（KeyedStream），相同键的元素会被分配到同一个分区中，后续的聚合操作仅在各自分区内进行
+
+- **注意**：
+
+  - 支持基于字段名（POJO类）、字段索引（数组/元组）、Lambda 表达式指定键
+  - 不能用于不可哈希的数据类型（如数组、自定义对象未重写 `hashCode` 方法）
+
+- **代码示例（基于元组字段索引）**
+
+  ```java
+  // 构建元组数据流：（单词，出现次数）
+  DataStream<Tuple2<String, Integer>> inputStream = env.fromElements(
+  	Tuple2.of("Hello", 1),
+      Tuple2.of("Flink", 1),
+      Tuple2.of("Hello", 1)
+  );
+  
+  // keyBy: 根据第 0 个字段（单词）分区
+  KeyedStream<Tuple2<String, Integer>> keyedStream = inputStream.keyBy(t -> t.f0);
+  ```
+
+##### 5.3.2.2 简单聚合（sum/min/max/minBy/maxBy）
+
+**基于 KeyedStream**
+
+1. **sum**
+
+   - **功能**：对指定字段进行累加求和
+
+   - **代码示例**
+
+     ```java
+     import org.apache.flink.api.java.tuple.Tuple2;
+     import org.apache.flink.streaming.api.datastream.DataStream;
+     import org.apache.flink.streaming.api.datastream.KeyedStream;
+     import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+     
+     public class SumOperatorDemo {
+         public static void main(String[] args) throws Exception {
+             StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+             env.setParallelism(1);
+             // 输入数据流
+             DataStream<Tuple2<String, Integer>> inputStream = env.fromElements(
+                     Tuple2.of("Hello", 1),
+                     Tuple2.of("Flink", 1),
+                     Tuple2.of("Hello", 1),
+                     Tuple2.of("Flink", 1),
+                     Tuple2.of("Java", 1)
+             );
+             // 1. keyBy 分区
+             KeyedStream<Tuple2<String, Integer>, String> keyedStream = inputStream.keyBy(t -> t.f0);
+             
+             // 2. sum 算子：对第一个字段（次数）求和
+             DataStream<Tuple2<String, Integer>> result = keyedStream.sum(1);
+             
+             result.print("sum算子输出");
+             env.execute();
+         }
+     }
+     ```
+
+   - **输出结果**（累加过程可见）：
+
+     ```tex
+     sum算子输出> (Hello,1)
+     sum算子输出> (Flink,1)
+     sum算子输出> (Hello,2)
+     sum算子输出> (Flink,3)
+     ```
+
+2. **min/max**
+
+   - **功能**
+
+     - `min`：获取指定字段的最小值，**仅更新聚合字段，其他字段保留第一条数据的值**
+
+     - `max`：获取指定字段的最大值，同样仅更新聚合字段，其它字段保留第一条数据的值
+
+3. **minBy/maxBy**
+
+   - **功能**
+
+     - `minBy`：获取指定字段的最小值对应的**整条记录**，所有字段都会更新为符合条件的记录值
+     - `maxBy`：获取指定字段的最大值对应的**整条记录**，所有字段都会更新为符合条件的记录值
+
+   - **区别示例（min vs minBy）**
+
+     ```java
+     / 输入数据流：商品名称、价格、库存
+     DataStream<Tuple3<String, Integer, Integer>> inputStream = env.fromElements(
+     	Tuple3.of("手机", 5000, 100),
+         Tuple3.of("电脑", 8000, 50),
+         Tuple3.of("手机", 4500, 150)
+     );
+     
+     KeyedStream<Tuples3<String, Integer, Integer>> keyedStream = inputStream.keyBy(t -> t.f0);
+     
+     // min(1): 仅价格字段取最小值，库存保留第一条记录的100
+     DataStream<Tuples3<String, Integer, Integer>> minStream = keyedStream.min(1);
+     
+     // minBy(1)：价格最小值对应的整条记录，库存更新为 150
+     DataStream<Tuples3<String, Integer, Integer>> minByStream = keyedStream.minBy(1);
+     ```
+
+   - **输出结果对比**：
+
+     - `min`输出：（手机, 4500, 100）
+     - `minBy`输出：（手机, 4500, 150）
+
+##### 5.3.2.3 规约聚合（reduce）
+
+- **功能**：更灵活的聚合操作，对 KeyedStream 中的元素进行**迭代式聚合**，输入两个元素，输出一个元素，最终得到单个聚合结果
+
+- **适用场景**：自定义聚合逻辑（如 累加、平均值、拼接字符串等）
+
+- **代码示例**（实现 sum 相同的功能，更灵活）：
+
+  ```java
+  DataStream<Tuple2<String, Integer>> resultStream = keyedStream.reduce((t1, t2) -> {
+      // t1：上一次聚合的结果，t2：当前待聚合的元素
+      return Tuple2.of(t1.fo, t1.f1 + t2.f1);
+  })
+  ```
+
+  
+
+#### 5.3.3 用户自定义函数（UDF）
+
+##### 5.3.3.1 函数类（Function Classes）
+
+这是 Flink 自定义函数的**标准实现方式**，通过实现 Flink 提供的专用函数接口，编写业务逻辑，适用于**中等复杂度、无状态**的场景，可读性和可维护性优于 Lambda 表达式
+
+**核心接口（常用）**
+
+Flink 为不同的算子提供了对应的函数接口，核心接口如下（均位于 `org.apache.flink.api.common.functions` 包下）：
+
+|     接口名称      | 对应算子  |                   功能描述                    |
+| :---------------: | :-------: | :-------------------------------------------: |
+|   `MapFunction`   |   `map`   |    一对一转换，输入一个元素，输出一个元素     |
+| `FlatMapFunction` | `flatMap` | 一对多转换，输入一个元素，输出 0/1 / 多个元素 |
+| `FilterFunction`  | `filter`  | 条件过滤，返回 `true` 保留元素，`false` 过滤  |
+| `ReduceFunction`  | `reduce`  |    迭代式聚合，输入两个元素，输出一个元素     |
+
+**实现步骤**
+
+1. 导入对应的函数接口。
+2. 自定义类实现该接口，重写接口中的核心方法（如 `map()`、`flatMap()`）。
+3. 将自定义函数类的实例传入对应的 Flink 算子中。
+
+**代码示例（以 `FlatMapFunction` 为例，文本拆分 + 过滤空单词）**
+
+```
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.api.common.functions.FlatMapFunction;
+import org.apache.flink.util.Collector;
+
+// 自定义 FlatMap 函数类：实现 FlatMapFunction 接口
+class MyFlatMapFunction implements FlatMapFunction<String, String> {
+    /**
+     * 核心方法：重写 flatMap()
+     * @param value 输入元素（每行文本）
+     * @param out 输出收集器：用于收集转换后的元素
+     */
+    @Override
+    public void flatMap(String value, Collector<String> out) throws Exception {
+        // 1. 非空判断（避免空指针异常）
+        if (value == null || value.trim().isEmpty()) {
+            return;
+        }
+        // 2. 按空格拆分文本
+        String[] words = value.trim().split(" ");
+        // 3. 遍历拆分结果，过滤空单词并输出
+        for (String word : words) {
+            if (!word.isEmpty()) {
+                out.collect(word);
+            }
+        }
+    }
+}
+
+public class UdfInterfaceDemo {
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(1);
+
+        // 输入数据流（包含空文本和空单词）
+        DataStream<String> inputStream = env.fromElements(
+            "Hello Flink",
+            "  Hello Big Data  ",
+            "",
+            "Flink  UDF   Demo"
+        );
+
+        // 传入自定义 FlatMap 函数实例
+        DataStream<String> resultStream = inputStream.flatMap(new MyFlatMapFunction());
+
+        resultStream.print("接口实现类 UDF 输出");
+        env.execute("UDF Interface Demo");
+    }
+}
+```
+
+**输出结果**
+
+```tex
+接口实现类 UDF 输出> Hello
+接口实现类 UDF 输出> Flink
+接口实现类 UDF 输出> Hello
+接口实现类 UDF 输出> Big
+接口实现类 UDF 输出> Data
+接口实现类 UDF 输出> Flink
+接口实现类 UDF 输出> UDF
+接口实现类 UDF 输出> Demo
+```
+
+**优势**
+
+1. 结构清晰，可读性强，便于复杂业务逻辑的扩展和维护。
+2. 支持异常处理、非空判断等复杂逻辑，鲁棒性更高。
+3. 类型明确，避免 Lambda 表达式的类型推断问题。
+
+
+
+##### 5.3.3.2 复函数类（Rich Function Classes）
+
+这是 Flink 自定义函数的**高级实现方式**，所有的富函数都继承自 `RichFunction` 接口，它在标准接口的基础上，提供了**运行时上下文（Runtime Context）**和**生命周期方法**，适用于**有状态、需要访问运行时信息、需要初始化 / 清理资源**的复杂场景
+
+**核心特性**
+
+1. **生命周期方法**：Flink 会在任务执行的不同阶段自动调用，用于资源的初始化和清理
+
+   - `open(Configuration parameters)`：**任务启动时调用一次**（每个并行任务实例仅调用一次），用于初始化资源（如创建数据库连接、加载配置文件、初始化缓存）
+   - `close`：**任务结束时调用一次**（每个并行任务实例仅调用一次），用于清理资源（如关闭数据库连接、释放缓存）
+   - `invoke(...)`：**处理每个元素时调用**（对应标准接口的核心方法，如`map()`、`flatMap()`）
+
+2. **运行上下文**：通过 `getRuntimeContext()` 方法获取，可访问：
+
+   - 任务的并行度、任务ID、作业名称
+   - 状态管理（Keyed State、Operator State）
+   - 广播变量（Broadcast Variables）
+
+   **常用富函数**
+
+   |      富函数接口       |   对应标准接口    | 对应算子  |
+   | :-------------------: | :---------------: | :-------: |
+   |   `RichMapFunction`   |   `MapFunction`   |   `map`   |
+   | `RichFlatMapFunction` | `FlatMapFunction` | `flatMap` |
+   | `RichFilterFunction`  | `FilterFunction`  | `filter`  |
+   | `RichReduceFunction`  | `ReduceFunction`  | `reduce`  |
+
+   **代码示例（以 `RichMapFunction` 为例，初始化资源 + 访问运行时上下文）**
+
+   ```java
+   import org.apache.flink.api.common.functions.RichMapFunction;
+   import org.apache.flink.configuration.Configuration;
+   import org.apache.flink.streaming.api.datastream.DataStream;
+   import org.apache.flink.streaming.api.datastream.DataStreamSource;
+   import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+   
+   // 自定义富函数类：实现 RichMapFunction 接口（输入 Integer，输出 String）
+   class MyRichMapFunction extends RichMapFunction<Integer, String> {
+       // 模拟：需要初始化的资源（如数据库连接、配置对象）
+       private String taskName;
+       private int parallelism;
+       private int taskId;
+   
+       /**
+        * 生命周期方法1: open() - 任务启动时调用（每个并行示例仅调用一次）
+        * @param parameters 配置参数
+        * @throws Exception
+        */
+       @Override
+       public void open(Configuration parameters) throws Exception {
+           // 调用父类方法
+           super.open(parameters);
+   
+           // 1. 获取运行时上下文信息
+           this.taskName = getRuntimeContext().getTaskName();
+           this.parallelism = getRuntimeContext().getNumberOfParallelSubtasks();
+           this.taskId = getRuntimeContext().getIndexOfThisSubtask();
+           
+           // 2. 模拟初始化资源（如加载配置、创建数据库连接）
+           System.out.println("===== 任务 " + taskId + " 初始化完成 ======");
+       }
+   
+       /**
+        * 核心方法：map() - 处理每个元素时调用
+        * @param value 输入元素
+        * @return 输出元素
+        * @throws Exception
+        */
+       @Override
+       public String map(Integer value) throws Exception {
+           // 转换逻辑：拼接数值和运行时信息
+           return String.format(
+                   "作业：%s | 并行度：%d | 任务ID：%d | 输入只：%d | 转换后值：%d",
+                   taskName, parallelism, taskId, value, value * 3
+           );
+       }
+   
+       /**
+        * 生命周期方法2: close() - 任务停止时调用（每个并行示例仅调用一次）
+        * @throws Exception
+        */
+       @Override
+       public void close() throws Exception {
+           // 模拟清理资源（如关闭数据库连接、释放内存）
+           System.out.println("===== 任务 " + taskId + " 资源清理完成 ======");
+           super.close();
+       }
+   }
+   
+   public class UdfRichFunctionDemo {
+       public static void main(String[] args) throws Exception {
+           StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+           // 设置并行度为 2， 便于观察不同任务实例的运行时信息
+           env.setParallelism(2);
+   
+           // 输入数据流
+           DataStreamSource<Integer> inputStream = env.fromElements(1, 2, 3, 4, 5);
+   
+           // 传入自定义的富函数实例
+           DataStream<String> stringDataStream = inputStream.map(new MyRichMapFunction());
+   
+           stringDataStream.print("富函数 UDF 输出");
+           env.execute();
+       }
+   }
+   ```
+
+   **输出结果（关键片段）**
+
+   ```tex
+   ===== 任务 0 初始化完成 =====
+   ===== 任务 1 初始化完成 =====
+   富函数 UDF 输出> 作业：Rich Function UDF Demo | 并行度：2 | 任务ID：0 | 输入值：1 | 转换后值：3
+   富函数 UDF 输出> 作业：Rich Function UDF Demo | 并行度：2 | 任务ID：1 | 输入值：2 | 转换后值：6
+   富函数 UDF 输出> 作业：Rich Function UDF Demo | 并行度：2 | 任务ID：0 | 输入值：3 | 转换后值：9
+   ...
+   ===== 任务 0 资源清理完成 =====
+   ===== 任务 1 资源清理完成 =====
+   ```
+
+   **核心适用场景**
+
+   1. **需要初始化 / 清理资源**：如创建 / 关闭数据库连接、Redis 连接、加载本地配置文件。
+   2. **需要访问运行时信息**：如获取作业名称、并行度、任务 ID，用于日志记录或监控。
+   3. **需要使用状态管理**：如实现有状态的计算（累计求和、去重），这是富函数最核心的优势（后续状态管理会详细展开）。
+   4. **需要使用广播变量**：将公共数据（如字典表）广播到所有并行任务，避免重复加载。
+
+3. **自定义函数的通用注意事项**
+
+   1. **序列化要求**：Flink 会将自定义函数序列化后分发到各个 TaskManager 上执行，因此：
+      - 自定义函数类必须实现 `Serializable` 接口（Flink 的核心函数接口已默认实现，自定义类无需显式实现）。
+      - 自定义函数中的成员变量如果是不可序列化的对象（如 `Connection`），应在 `open()` 方法中初始化，而非在构造方法中。
+   2. **无状态设计优先**：除非业务需要，否则尽量实现无状态的自定义函数，避免状态管理带来的复杂度，同时提高作业的容错性和可扩展性。
+   3. **异常处理**：在核心业务逻辑中添加适当的异常处理（如 `try-catch`），避免单个元素的处理异常导致整个任务失败。
+   4. **性能优化**：
+      - 避免在 `map()`、`flatMap()` 等高频调用方法中创建对象（如 `new String()`），应在 `open()` 方法中初始化可复用对象。
+      - 对于大规模数据处理，尽量减少不必要的数据拷贝和复杂计算。
+
+#### 5.3.4 物理分区算子（Physical Paritioning）
+
+
+
+#### 5.3.5 分流
+
+
+
+#### 5.3.6 基本合流操作
 
 
 
