@@ -1856,7 +1856,7 @@ public class UdfInterfaceDemo {
 
 
 
-##### 5.3.3.2 复函数类（Rich Function Classes）
+##### 5.3.3.2 富函数类（Rich Function Classes）
 
 这是 Flink 自定义函数的**高级实现方式**，所有的富函数都继承自 `RichFunction` 接口，它在标准接口的基础上，提供了**运行时上下文（Runtime Context）**和**生命周期方法**，适用于**有状态、需要访问运行时信息、需要初始化 / 清理资源**的复杂场景
 
@@ -1996,15 +1996,291 @@ public class UdfInterfaceDemo {
 
 #### 5.3.4 物理分区算子（Physical Paritioning）
 
+##### 5.3.4.1 随机分区（shuffle）
 
+**核心作用**
+
+将数据**随机、均匀地**分发到下游算子的各个并行任务中，打破数据的原有顺序和分区规律
+
+**关键特性**
+
+- 分发结果无规律，每次运行结果可能不同
+- 能保证数据大体均匀分布，常用于解决简单的数据倾斜（但不解决基于键的倾斜，仅做均匀打散）
+- 会破坏数据的局部性，带来一定的网络传输开销
+
+**适用场景**
+
+- 上游数据分区不均匀，需要简单打散以避免下游部分任务负载过高
+- 不关心数据后续处理的任务归属，仅需要均匀分发
+
+**代码示例**
+
+```java
+public class ShufflePartitionDemo {
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        // 设置下游算子的并行度为 3（方便看到分区效果）
+        env.setParallelism(3);
+        
+        // 生成测试数据
+        DataStreamSource<Integer> inputStream = env.fromElements(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+        
+        // 执行随机分区
+        DataStream<Integer> shuffleStream = inputStream.shuffle();
+        
+        // 打印结果（查看数据分发到哪个并行任务）
+        shuffleStream.print("shuffle分区结果");
+        
+        env.execute("Flink Shuffle Partition Demo");
+    }
+}
+```
+
+**输出特点**
+
+数据会被随机分配到 3 个并行任务中（输出前缀为并行任务编号），例如：
+
+```tex
+shuffle分区结果> 2> 1
+shuffle分区结果> 1> 2
+shuffle分区结果> 0> 3
+shuffle分区结果> 2> 4
+```
+
+##### 5.3.4.2 轮训分区（rebalance）
+
+**核心作用**
+
+采用**Round-Robin（轮询）**策略，将数据依次、均匀地分发到下游算子的各个并行任务中，是解决数据倾斜的常用算子
+
+**关键特性**
+
+- 分发规则固定（依次循环），数据均匀性比 `Shuffle()` 更有保障
+- 属于**重平衡分区**，会重新规划数据分发路径，解决上游算子任务负载不均匀导致的下游数据倾斜
+- 有轻微的网络开销，但整体性能优于 `Shuffle`
+
+**适用场景**
+
+- 上游算子各任务输出数据量差异较大（数据倾斜），需要下游均匀接收
+- 希望数据按固定顺序均匀分发，不依赖随机策略
+
+**示例代码**
+
+```java
+public class RebalancePartitionDemo {
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        // 设置下游算子的并行度为 3（方便看到分区效果）
+        env.setParallelism(3);
+
+        // 生成测试数据
+        DataStreamSource<Integer> inputStream = env.fromElements(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+
+        // 执行轮训分区
+        DataStream<Integer> shuffleStream = inputStream.rebalance();
+
+        // 打印结果（查看数据分发到哪个并行任务）
+        shuffleStream.print("rebalance分区结果");
+
+        env.execute("Flink Rebalance Partition Demo");
+    }
+}
+```
+
+**输出特点**
+
+```tex
+rebalance分区结果> 0> 1
+rebalance分区结果> 1> 2
+rebalance分区结果> 2> 3
+rebalance分区结果> 0> 4
+rebalance分区结果> 1> 5
+```
+
+##### 5.3.4.3 重缩放分区（rescale）
+
+**核心作用**
+
+采用**局部轮询**策略，仅在相邻的算子任务之间进行轮询分发，是一种轻量级的重分区算子
+
+**关键特性**
+
+- 与 `rebalance()`的区别是：`rebalance` 是全局轮询（上游所有任务对下游所有任务轮询），`rescle()` 是局部轮询（上游一个任务仅对下游部分任务轮询）
+- 网络开销远小于 `rebalance` 和 `shuffle`，因为它优先利用数据本地性，减少跨节点传输
+- 均匀性略逊于 `rebalance()`，仅适用于上下游算子并行度成**整倍数**的场景（效果最佳）
+
+**适用场景**
+
+- 上下游算子并行度成整倍数（例如上游并行度2，下游并行度 4），需要轻量级均匀分发
+- 注重性能，希望减少网络传输开销，且对数据均匀性要求不是极致严格
+
+**示例代码**
+
+```java
+public class RescalePartitionDemo {
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        // 设置下游算子的并行度为 3（方便看到分区效果）
+        env.setParallelism(3);
+
+        // 生成测试数据
+        DataStreamSource<Integer> inputStream = env.fromElements(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+
+        // 执行缩放分区
+        DataStream<Integer> shuffleStream = inputStream.rebalance();
+
+        // 打印结果（查看数据分发到哪个并行任务）
+        shuffleStream.print("Rescale分区结果");
+
+        env.execute("Flink Rescale Partition Demo");
+    }
+}
+```
+
+**补充说明**
+
+假设上游并行度 2，下游并行度 4：
+
+- 上游任务 0 会轮询分发数据到下游任务 0、1
+- 上游任务 1 会轮询分发数据到下游任务 2、3
+- 避免了跨任务组的网络传输，提高效率
+
+##### 5.3.4.4 广播（broadcast）
+
+**核心作用**
+
+将**上游的每一条数据**都复制一份，分发到下游算子的**所有并行任务**中，下游每个任务都会收到全量的上游数据
+
+**关键特性**
+
+- 数据会被复制多份（复制分数 = 下游并行度），网络开销和内存开销极大，需谨慎使用
+- 无需指定下游并行度，下游所有任务都会接收全量数据
+- 不会改变数据的原有内容，仅做全量复制分发
+
+**适用场景**
+
+- 分发配置数据、规则数据（例如风控规则、字典表），下游每个任务都需要依赖全量配置进行处理
+- 小批量静态数据的分发，不适合大数据量流数据
+
+**示例代码**
+
+```java
+public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(3);
+
+        // 配置数据（需要广播的全量数据）
+        DataStreamSource<String> configStream = env.fromElements("rule1: 大于100", "rule2: 小于0", "rule3: 偶数");
+
+        // 执行广播分区
+        DataStream<String> broadcastStream = configStream.broadcast();
+
+        // 业务数据
+        DataStreamSource<Integer> businessStream = env.fromElements(101, -5, 20, 300);
+
+        // 下游任务结合广播数据处理（这里仅打印广播数据）
+        businessStream.map(value -> {
+            // 实际业务中可获取广播的配置数据进行判断
+            return "业务数据 " + value + ", 需结合广播规则处理";
+        }).print("结合广播数据");
+
+        env.execute("Flink Broadcast Partition Demo");
+    }
+```
+
+**输出特点**
+
+下游每个并行任务都会收到全量的广播配置数据，无数据丢失
+
+##### 5.3.4.5 全局分区（global）
+
+**核心作用**
+
+将**所有上游数据**都分发到下游算子的**第一个并行任务（编号 0）**中，是一种特殊的分区策略
+
+**关键特性**
+
+- 会导致下游单个任务负载极高，极易出现数据倾斜和任务瓶颈
+- 仅适用于特殊场景，一般不推荐在生产环境中使用（除了必须单任务处理的场景）
+- 并行度会被强制收敛为 1（下游算子即使）
+
+**适用场景**
+
+
+
+**示例代码**
+
+```java
+
+```
+
+**输出特点**
+
+##### 5.3.4.6 自定义分区（custom）
+
+**核心作用**
+
+
+
+**关键特性**
+
+
+
+**适用场景**
+
+
+
+**示例代码**
+
+```java
+
+```
+
+**输出特点**
 
 #### 5.3.5 分流
 
+**核心作用**
 
+
+
+**关键特性**
+
+
+
+**适用场景**
+
+
+
+**示例代码**
+
+```java
+
+```
+
+**输出特点**
 
 #### 5.3.6 基本合流操作
 
+**核心作用**
 
+
+
+**关键特性**
+
+
+
+**适用场景**
+
+
+
+**示例代码**
+
+```java
+
+```
+
+**输出特点**
 
 ### 5.4 输出算子（Sink）
 
