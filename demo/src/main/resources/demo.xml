@@ -1,0 +1,40 @@
+<flink-job name="ComplexTrafficJob">
+    <settings>
+        <defaultParallelism>2</defaultParallelism>
+    </settings>
+
+    <data-types>
+        <type id="T_Order" class="com.demo.model.OrderEvent" />
+    </data-types>
+
+    <sources>
+        <source id="socket-src-1" class="com.demo.source.SocketHandler">
+            <properties><property name="port" value="9000"/></properties>
+        </source>
+        <source id="socket-src-2" class="com.demo.source.SocketHandler">
+            <properties><property name="port" value="9001"/></properties>
+        </source>
+    </sources>
+
+    <transforms>
+        <transform id="union-stream" inputs="socket-src-1,socket-src-2" type="union" />
+
+        <transform id="window-agg" inputs="union-stream" class="com.demo.op.AmountAggregator">
+            <io-type in="T_Order" out="T_Result" />
+            <key-by>userId</key-by>
+            <window type="tumbling" size="10s" />
+        </transform>
+
+        <transform id="split-node" inputs="window-agg" class="com.demo.op.ThresholdSplitter">
+            <outputs>
+                <output tag="ALERT" id="high-value-stream" />
+                <output tag="NORMAL" id="normal-value-stream" />
+            </outputs>
+        </transform>
+    </transforms>
+
+    <sinks>
+        <sink id="alert-sink" input="high-value-stream" class="com.demo.sink.SmsAlertSink" />
+        <sink id="db-sink" input="normal-value-stream" class="com.demo.sink.ConsoleSink" />
+    </sinks>
+</flink-job>

@@ -1,4 +1,4 @@
-package com.demo;
+package com.demo.example01;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.flink.streaming.api.datastream.DataStream;
@@ -13,8 +13,8 @@ public class ConfigurableFlinkJob {
 
         // 1. 模拟配置文件内容 (实际生产中可以从本地文件或 Apollo 加载)
         String jsonConfig = "[" +
-                "{\"id\":\"f1\", \"className\":\"com.demo.FilterOp\", \"parallelism\":2, \"chainingStrategy\":\"DEFAULT\", \"params\":{\"min\":10}}," +
-                "{\"id\":\"m1\", \"className\":\"com.demo.MapOp\", \"parallelism\":2, \"chainingStrategy\":\"START_NEW\", \"params\":{\"prefix\":\"A\"}}" +
+                "{\"id\":\"f1\", \"className\":\"com.demo.example01.FilterOp\", \"parallelism\":2, \"chainingStrategy\":\"DEFAULT\", \"params\":{\"min\":10}}," +
+                "{\"id\":\"m1\", \"className\":\"com.demo.example01.MapOp\", \"parallelism\":2, \"chainingStrategy\":\"START_NEW\", \"params\":{\"prefix\":\"A\"}}" +
                 "]";
 
         ObjectMapper mapper = new ObjectMapper();

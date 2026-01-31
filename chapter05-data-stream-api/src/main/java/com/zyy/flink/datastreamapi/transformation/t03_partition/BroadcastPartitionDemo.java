@@ -1,4 +1,4 @@
-package com.zyy.flink.datastreamapi.partition;
+package com.zyy.flink.datastreamapi.transformation.t03_partition;
 
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
